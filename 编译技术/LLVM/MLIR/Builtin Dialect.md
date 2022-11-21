@@ -32,6 +32,7 @@ module {
   * `MemRefType`: 代表某块内存空间的引用的类型, 可以任意维度跟阶, 和张量差不多 (`memref<1 x 0 x f32>`)
     * `UnrankedMemRefType`, 长度不确定版本, `memref<*xf32>`
     * 多维的还可以带一个 layout, 指定诸如行优先还是列优先之类的, 但是更加地灵活, 可以视作 "索引到实际位置的映射"
+    * 细节参见 [MemoryRef Dialect > 类型定义](MemoryRef%20Dialect.md#lei-xing-ding-yi)
   * `NoneType`: 是 `()`, 不是 `absurd`. 有且只有一个值.
   * `TupleType`
 * 不算很基本的类型

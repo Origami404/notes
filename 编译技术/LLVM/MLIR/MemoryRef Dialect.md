@@ -1,6 +1,163 @@
 The `memref` dialect is intended to hold core memref creation and manipulation ops, which are not strongly associated with any particular other dialect or domain abstraction.
 
+## 类型定义
+
+Ref: https://mlir.llvm.org/docs/Dialects/Builtin/#memreftype
+
 MemRef 类型在 [Builtin Dialect](Builtin%20Dialect.md) 中被定义.
+
+````
+memref-type ::= `memref` `<` dimension-list-ranked type
+                (`,` layout-specification)? (`,` memory-space)? `>`
+layout-specification ::= attribute-value
+memory-space ::= attribute-value
+````
+
+一个 MemRef 代表一块内存区域, 它具有:
+
+* 基本类型: 里面单个元素的基本类型, 它可以是:
+  * 内建的整数, 索引, 浮点类型
+  * 内建的向量类型和 MemRef 类型
+  * 任何其它实现了 `MemRefElementTypeInterface` 接口的类型
+* 形状 (shape)
+  * 有阶和维度的概念, 同样有 `*` 代表任意阶和 `?` 代表长度未知维度.
+  * 可以任意嵌套, `1x0` 跟 `0x1` 不认为是相同的类型
+* 布局模式 (layout): 指定这个多维的地址空间 (索引) 如何映射到线性地址空间 (地址) 的模式
+  * 不能具有内部别名: 两个不一样的, 非越界索引必须被映射到不同的地址上
+  * 内建方言提供了两种现成的布局模式: 仿射变换模式 (affine map) 和 基于步长的模式 (strided)
+
+它这个 "一块" 并**不一定是连续的一块**, 也**不一定是独占的一块**. 它可以是在真正的线性内存中跳着选的一块, 也可以是另一个 MemRef 或者被其它对象所持有的一块内存的视图. 
+
+如果两个 MemRef 的布局模式不同, 那么它们的类型也不同. 换言之, `memref<4xi32>` != `memref<4xi32, strided<[1], offset: 2>`, 即使它们只有偏移不同.
+
+### 布局模式
+
+#### 仿射布局模式
+
+仿射布局模式相当于直接提供一个 (功能有限制的) 地址计算函数 ([半仿射变换](Affine%20Dialect.md#ban-fang-she-bian-huan)) 作为布局模式. 常见的仿射布局有下面这些:
+
+````mlir
+// MxN matrix stored in row major layout in memory:
+#layout_map_row_major = (i, j) -> (i, j)
+
+// MxN matrix stored in column major layout in memory:
+#layout_map_col_major = (i, j) -> (j, i)
+
+// MxN matrix stored in a 2-d blocked/tiled layout with 64x64 tiles.
+#layout_tiled = (i, j) -> (i floordiv 64, j floordiv 64, i mod 64, j mod 64)
+````
+
+更多的例子如下:
+
+````mlir
+// Identity index/layout map
+#identity = affine_map<(d0, d1) -> (d0, d1)>
+
+// Column major layout.
+#col_major = affine_map<(d0, d1, d2) -> (d2, d1, d0)>
+
+// A 2-d tiled layout with tiles of size 128 x 256.
+#tiled_2d_128x256 = affine_map<(d0, d1) -> (d0 div 128, d1 div 256, d0 mod 128, d1 mod 256)>
+
+// A tiled data layout with non-constant tile sizes.
+#tiled_dynamic = affine_map<(d0, d1)[s0, s1] -> (d0 floordiv s0, d1 floordiv s1,
+                             d0 mod s0, d1 mod s1)>
+
+// A layout that yields a padding on two at either end of the minor dimension.
+#padded = affine_map<(d0, d1) -> (d0, (d1 + 2) floordiv 2, (d1 + 2) mod 2)>
+
+
+// The dimension list "16x32" defines the following 2D index space:
+//
+//   { (i, j) : 0 <= i < 16, 0 <= j < 32 }
+//
+memref<16x32xf32, #identity>
+
+// The dimension list "16x4x?" defines the following 3D index space:
+//
+//   { (i, j, k) : 0 <= i < 16, 0 <= j < 4, 0 <= k < N }
+//
+// where N is a symbol which represents the runtime value of the size of
+// the third dimension.
+//
+// %N here binds to the size of the third dimension.
+%A = alloc(%N) : memref<16x4x?xf32, #col_major>
+
+// A 2-d dynamic shaped memref that also has a dynamically sized tiled
+// layout. The memref index space is of size %M x %N, while %B1 and %B2
+// bind to the symbols s0, s1 respectively of the layout map #tiled_dynamic.
+// Data tiles of size %B1 x %B2 in the logical space will be stored
+// contiguously in memory. The allocation size will be
+// (%M ceildiv %B1) * %B1 * (%N ceildiv %B2) * %B2 f32 elements.
+%T = alloc(%M, %N) [%B1, %B2] : memref<?x?xf32, #tiled_dynamic>
+
+// A memref that has a two-element padding at either end. The allocation
+// size will fit 16 * 64 float elements of data.
+%P = alloc() : memref<16x64xf32, #padded>
+
+// Affine map with symbol 's0' used as offset for the first dimension.
+#imapS = affine_map<(d0, d1) [s0] -> (d0 + s0, d1)>
+// Allocate memref and bind the following symbols:
+// '%n' is bound to the dynamic second dimension of the memref type.
+// '%o' is bound to the symbol 's0' in the affine map of the memref type.
+%n = ...
+%o = ...
+%A = alloc (%n)[%o] : <16x?xf32, #imapS>
+````
+
+#### 基于步长的布局模式
+
+基于步长的模式就是非常常见的下面这种模式:
+
+$$
+A\_{d_0, d_1, \cdots, d\_{n-1}} = \mathrm{offset} + \sum\_{i=0}^{n-1} d_i \*\\mathrm{stride}\_i 
+$$
+写成仿射变换就是:
+
+````mlir
+affine_map<(d0, ... dN)[offset, stride0, ... strideN] -> 
+            (offset + d0 * stride0 + ... dN * strideN)>
+````
+
+它是变换到**以基元素为单位**的一维连续索引空间去, 而不是以字节为单位的内存地址空间. 举个例子, 假如我们想写一个行优先的 2x3x4 的数组, 那么我们就应该写: `memref<2x3x4xf32, strided<[12, 4, 1], offset: 0>>`. 然而这种情况实在是太常见了, 所以一般我们只会直接写 `memref<2x3x4xf32>`, 让编译器帮我们算出一个默认的 `strided` 来. 同时省略 `offset` 属性那就是默认为 0.
+
+这种模式实际上是一个语法糖. 它能处理的情况仿射变换全都能处理, 但是这种情况能覆盖大部分索引模式, 所以单独给了一个.
+
+### 例子
+
+![MemRef-Example.png](assert/MemRef-Example.png)
+
+假如我们想要分配一块连续内存, 给 `m1`, 让它具有上面的这些内容和到行优先的到内存空间的布局. 同时创建一个视图给 `m2`, 让它成为一个 4x4 矩阵里的 2x2 视图, 那么我们可以这样写:
+
+首先, 我们需要分配一块内存空间:
+
+````mlir
+%m1 = memref.alloc : memref<4x4xi32>
+
+; 写得详细一点, 那就是:
+; %m1 = memref.alloc : memref<4x4xi32, strided<[4, 1], offset: 0>>
+````
+
+然后我们写入一下数据:
+
+````mlir
+memref.store 0, %m1[0, 0] : memref<4x4xi32>
+memref.store 1, %m1[0, 1] : memref<4x4xi32>
+memref.store 2, %m1[0, 2] : memref<4x4xi32>
+// 省略一大摞的 store
+memref.store 15 %m1[3, 3] : memref<4x4xi32>
+````
+
+接着我们来创建一个视图:
+
+````mlir
+// 创建一个对 %m1 的视图, 它在两个维度上分别有偏移量 2 (第一个 [2, 2]), 
+// 然后各个维度的长度都是 2 (第二个 [2, 2]), 各个维度的步长为 [2, 1]
+// 由于原来的 memref 是 4x4 的, 一个相对原来的 [2, 2] 的偏移可以计算出总偏移为
+// 2*4 + 2 = 10 个基元素, 所以结果的 memref 类型具有一个 offset: 10
+%m2 = memref.subview %m1[2, 2][2, 2][2, 1]
+    : memref<4x4xi32> to memref<2x2xi32, strided<[2, 1], offset: 10>>
+````
 
 ## 分配/读取/写入
 
@@ -10,7 +167,7 @@ MemRef 类型在 [Builtin Dialect](Builtin%20Dialect.md) 中被定义.
 `memref.alloc` `(`$dynamicSizes`)` (`[` $symbolOperands^ `]`)? attr-dict `:` type($memref)
 ````
 
-分配内存. 对于定长的 memref, 可以直接留空 `$dynamicSizes`, 直接靠类型信息分配; 对于不定长的就要给这个. 后边的 `$symbolOperands` 部分是给 affine 那边用的, 可以不用管.
+分配内存. 对于定长的 memref, 可以直接留空 `$dynamicSizes`, 直接靠类型信息分配; 对于不定长的就要给这个. 后边的 `$symbolOperands` 部分是给 affine 那边用的, 用于为仿射变换提供符号的值.
 
 ````mlir
 // 分配内存, 直接通过后面的 memref 类型推断
@@ -19,6 +176,10 @@ MemRef 类型在 [Builtin Dialect](Builtin%20Dialect.md) 中被定义.
 %1 = memref.alloc(%d) : memref<8x?xf32, 1>
 // 带对齐地分配内存
 %2 = memref.alloc() {alignment = 8} : memref<8x64xf32, 1>
+
+// 表示对 %3[i, j] 的访问会访问到 [i + %s, j] 上
+%3 = memref.alloc()[%s] : memref<8x64xf32,
+                          affine_map<(d0, d1)[s0] -> ((d0 + s0), d1)>, 1>
 ````
 
 ### `memref.alloca`
@@ -167,7 +328,9 @@ memref.reinterpret_cast %unranked to
 
 ### `memref.reshape`
 
-改变一个 MemRef 的形状 (即阶数与各阶维度长度). 下面提到的 \[\[MemoryRef Dialect#`memref.collapse_shape`\|`memref.collapse_shape`\]\] 和 \[\[MemoryRef Dialect#`memref.expand_shape`\|`memref.expand_shape`\]\] 同样是改变形状, 但是它们只能用一个字面量来指定如何合并或拆分 MemRef 的
+改变一个 MemRef 的形状 (即阶数与各阶维度长度). 下面提到的 \[\[MemoryRef Dialect#`memref.collapse_shape`\|`memref.collapse_shape`\]\] 和 \[\[MemoryRef Dialect#`memref.expand_shape`\|`memref.expand_shape`\]\] 同样是改变形状, 但是它们只能用一个字面量来指定如何合并或拆分 MemRef 的.
+
+TODO: 没搞懂
 
 ### `memref.collapse_shape`
 
@@ -222,6 +385,32 @@ memref.reinterpret_cast %unranked to
 %unit = memref.expand_shape %2 [] : memref<f32> into memref<1x1x1xf32>
 ````
 
+### `memref.view`
+
+````
+`memref.view` $source `[` $byte_shift `]` `[` $sizes `]` attr-dict
+    `:` type($source) `to` type(results)
+````
+
+此操作从内存建立起带维度的 MemRef 视图.
+
+* `$source` 必须是一个 `memref<Nxi8, strided<[1], offset: 0>>`, 其中 `N` 是一个整数或是 `?`. 
+* `$byte_shift` 指定构建出的 MemRef 的偏移量, 必须是动态的, 必须指定, 0 也要
+* `$sizes` 指定目标 MemRef 中的动态维度大小的长度'
+* 构造的结果 MemRef 只支持 `offset: 0` 和默认布局
+
+````mlir
+// 分配一个扁平的一维 i8 数组
+%0 = memref.alloc() : memref<2048xi8>
+
+// 构建一个视图, 它从 %offset_1024 开始, 占到 %offset_1024 + 64*4*4 (f32/i8 == 4) 这么多的内存
+%1 = memref.view %0[%offset_1024][] : memref<2048xi8> to memref<64x4xf32>
+
+// 同样构建视图, 但是使用了动态维度大小
+%2 = memref.view %0[%offset_1024][%size0, %size1] :
+  memref<2048xi8> to memref<?x4x?xf32>
+````
+
 ## 普通操作
 
 ### `memref.rank`
@@ -259,6 +448,20 @@ memref.reinterpret_cast %unranked to
 ````
 
 复制数据.
+
+### `memref.subview`
+
+````
+`memref.subview` $source 
+    custom<DynamicIndexList>($offsets, $static_offsets, "ShapedType::kDynamicStrideOrOffset")
+    custom<DynamicIndexList>($sizes, $static_sizes, "ShapedType::kDynamicSize")
+    custom<DynamicIndexList>($strides, $static_strides, "ShapedType::kDynamicStrideOrOffset")
+    attr-dict `:` type($source) `to` type($result)
+````
+
+从给定 MemRef 中创建子视图. 它会给结果类型一个特殊的布局.
+
+TODO: 找到如何忽略布局接收 memref 的方法
 
 ### `memref.global`
 
@@ -454,11 +657,7 @@ def AtomicRMWKindAttr : I64EnumAttr<
 ````
 
  > 
- > assign 是按位的还是按值的?\```
- > pip install obsidianhtml
-
-````
-
+ > assign 是按位的还是按值的?
 
 ## DMA 相关
 
@@ -466,4 +665,4 @@ DMA, Direct Memory Access, 是指绕开 CPU, 直接在内存内部将数组从�
 
 MemRef 中对 DMA 的支持由一系列 `dma_` 开头的操作支持. 
 
-此部分 TODO.````
+此部分 TODO.

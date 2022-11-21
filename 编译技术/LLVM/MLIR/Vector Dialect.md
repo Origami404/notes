@@ -6,3 +6,31 @@ MLIR 提供了一个通用的, 平台无关的 `vector` 类型, 这个类型可�
 
 ![CodeGen Level in MLIR.png](assert/CodeGen%20Level%20in%20MLIR.png)
 ![Dialects near MLIR.png](assert/Dialects%20near%20MLIR.png)
+
+## 操作
+
+### `vector.vscale`
+
+搞不懂
+
+### `vector.bitcast`
+
+````
+`vector.bitcast` $source attr-dict `:` type($source) `to` type($result)
+````
+
+按位转换. 不能动阶, 可以动基类型和维度, 总的按字节长度要保持前后一致.
+
+````mlir
+// Example casting to a smaller element type.
+%1 = vector.bitcast %0 : vector<5x1x4x3xf32> to vector<5x1x4x6xi16>
+
+// Example casting to a bigger element type.
+%3 = vector.bitcast %2 : vector<10x12x8xi8> to vector<10x12x2xi32>
+
+// Example casting to an element type of the same size.
+%5 = vector.bitcast %4 : vector<5x1x4x3xf32> to vector<5x1x4x3xi32>
+
+// Example casting of 0-D vectors.
+%7 = vector.bitcast %6 : vector<f32> to vector<i32>
+````
